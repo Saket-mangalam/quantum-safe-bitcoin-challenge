@@ -98,18 +98,55 @@ def run_bridge(cfg, bench_exec, probdir, out_path):
                  "read-only sandbox can see it")
     outdir = Path(os.environ.get("QSB_BRIDGE_OUTDIR") or (ROOT.parent / f"qsb-bridge-out-{cfg['bench']}"))
     outdir.mkdir(parents=True, exist_ok=True)
+    metrics_path = outdir / "metrics.json"
+    # The bridge publishes metrics.json itself. A leftover file from an earlier
+    # invocation must never be read as this run's result, and the bridge refuses
+    # a non-empty OUTDIR anyway, so clear it before the kernel starts.
+    if metrics_path.exists():
+        try:
+            metrics_path.unlink()
+        except OSError as e:
+            sys.exit(f"bridge: could not clear stale {metrics_path} ({e}); remove it, or point "
+                     "QSB_BRIDGE_OUTDIR at an empty directory")
+
+    # The ranked bridge is a root-owned script that exists only on the
+    # self-hosted GPU runner (see .github/workflows/benchmark.yml preflight).
+    # Off that host it is simply absent: say so here instead of letting the
+    # failure surface later as a confusing complaint about metrics.json.
+    if not Path(bench_exec).is_file():
+        sys.exit(
+            "bridge: " + bench_exec + " not found — the 'bridge:' grinder only runs on the "
+            "ranked GPU runner. For a local run, override the grinder:\n"
+            "  QSB_GRINDER=cpu ./benchmark.sh " + cfg["bench"] + "            # reference grinder, correctness only\n"
+            "  QSB_GRINDER=\"cmd:python3 harness/gpu_wrap.py --src candidates/{bench}/{bench}.cu\" "
+            "./benchmark.sh " + cfg["bench"] + "   # CUDA host"
+        )
 
     cmd = ["sudo", "-n", bench_exec, "qsb-bench-v1", "run", cfg["bench"], str(ROOT), str(outdir),
            str(int(cfg["max_seconds"])), str(cfg["leading_zero_bits"]), problem_rel]
     print(f"▶ grinder: {' '.join(cmd)}", flush=True)
     rc = subprocess.run(cmd).returncode
 
+    # The bridge's own exit status is the primary signal. Parsing its output
+    # first turned "the bridge never ran" into "missing or invalid metrics.json",
+    # which points at the wrong file; report the command failure as itself.
     try:
-        metrics = json.loads((outdir / "metrics.json").read_text())
-        assert metrics["schema"] == "yukon.gpu-bench-metrics.v1" and metrics["bench"] == cfg["bench"]
+        raw = metrics_path.read_text()
+    except OSError as e:
+        sys.exit(f"bridge: {' '.join(cmd)}\n"
+                 f"bridge: exited {rc} and published no {metrics_path} ({e})")
+    try:
+        metrics = json.loads(raw) if raw.strip() else None
+        if metrics is None:
+            raise ValueError("file is empty — the bridge did not finish writing it")
+        if metrics.get("schema") != "yukon.gpu-bench-metrics.v1":
+            raise ValueError(f"unexpected schema {metrics.get('schema')!r}")
+        if metrics.get("bench") != cfg["bench"]:
+            raise ValueError(f"metrics are for bench {metrics.get('bench')!r}, "
+                             f"expected {cfg['bench']!r}")
         float(metrics["wall_s"])
-    except (OSError, ValueError, KeyError, AssertionError) as e:
-        sys.exit(f"bridge: missing or invalid {outdir / 'metrics.json'}: {e}")
+    except (ValueError, KeyError, TypeError) as e:
+        sys.exit(f"bridge: invalid {metrics_path} (bridge exited {rc}): {e}")
 
     published = outdir / f"run-{cfg['bench']}.json"
     if not published.is_file():
