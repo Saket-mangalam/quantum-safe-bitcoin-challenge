@@ -1752,3 +1752,82 @@ deferred recurrence on 20,000 arbitrary-field accumulations, 1,000 curve
 accumulations, and 1,000 complete mixed-window accumulations. It also checks
 the production source form and the invariant after every intermediate point.
 All inherited field, root, vector-state, finish, and SHA-tail audits pass.
+
+## Local tooling: matched A/B harness and a portable tail audit (2026-09-17)
+
+No kernel change. Both items remove friction from the develop-on-CPU,
+measure-on-GPU loop this log already follows.
+
+`ab.sh` is the script the experiment-switch block at the top of `pinning.cu`
+refers to ("ab.sh overrides them with -D on the build line") but which was
+never committed. It takes a list of `NAME=VALUE` switch sets, builds each with
+`-D` on the documented `nvcc` line, and measures every one against a single
+pinned problem seed at one difficulty for one fixed window. It writes the build
+stamp `gpu_wrap.py` checks, so the compile stays outside the timed interval;
+that handshake was tested directly against `harness/gpu_wrap.py`, where a
+matching stamp is reused and a stamp naming a different `N` exits 3. Scores come
+from the harness clock and its verified hits, never from the kernel's advisory
+M/s line. The summary prints each variant's delta against the baseline and
+repeats the two thresholds that matter: +1.00 percent for promotion, and roughly
+1/sqrt(hits) of noise on a short run. `QSB_PROBE_MASK` runs are expected to fail
+verification and are reported as failures, which is the correct outcome for a
+switch documented as wrong math.
+
+`QSB_AB_DRYRUN=1` prints the build and run plan without invoking `nvcc`, so the
+grid can be checked on a workstation with no CUDA device.
+
+`check_tail_words.py` now carries its own SHA-256 block compression instead of
+calling libcrypto's `SHA256_Transform` through ctypes. That path is not
+portable: macOS aborts the process rather than dlopening its unversioned
+libcrypto stub, and the LibreSSL copies it does ship disagree with OpenSSL for
+this call. Every case is still compared against hashlib, so a wrong compression
+cannot pass silently, and the audit reports the same 2,320 comparisons as
+before. With this fixed, the whole ten-script audit suite runs on a CPU-only
+workstation in about 16 seconds.
+
+Startup cost was examined as an optimisation target and rejected. The host-side
+elliptic-curve work at kernel start -- `gt_build_ladders` plus the 252-point
+`gt_spot_check` -- measured 0.23 s through libcrypto, and the 64 MiB
+device-to-host copy feeding the check is single-digit milliseconds. Against a
+1200-second window that whole region is under 0.05 percent, far below both the
+1 percent promotion threshold and the roughly 0.7 percent statistical noise of
+the score. Removing the spot check would also give up the guard that catches a
+wrong table, whose failure mode is a full ranked run with zero verifiable hits.
+
+## Audit suite realigned with the promoted kernel (2026-09-17)
+
+Five of the ten audits failed against the current candidate. Every failure was
+in `audit_source()`, never in a mathematical check, so the algebra was still
+sound — but the source half of the safety net had stopped inspecting the kernel
+that actually ships. Two of the five were also modelling shapes the default
+build no longer uses, which is the more serious half: they passed their maths
+against the wrong kernel.
+
+* `audit_vector_state_layout.py` asserted 8 state planes and 128 bytes per
+  candidate. `QSB_SYM_FINISH` defaults to 1, so a ranked build stores Y, ZZZ and
+  W in 6 planes, 96 bytes, 1.5 GiB at 16,777,216 candidates. It now models both
+  layouts and checks each against its own branch of the source, including that W
+  stays in planes 4-5 so the tree kernels index it identically.
+* `audit_external_pipeline.py` modelled a 256-leaf product tree. The tree is
+  templated on `QSB_TREE_N`, whose default is now 128, so it now models 256, 128
+  and 64, asserts the compiled-in width is one it models, and matches the
+  templated source forms rather than literal 256s.
+* `audit_superbatch_roots.py` capped its model at one super block. With a 16M
+  batch at `QSB_TREE_N=128` there are 131,072 search CTAs and therefore 512
+  groups, so `qsb_invert_super_roots` runs several blocks and performs one
+  `_ModInv` each. The model now covers that and asserts the inversion count.
+* `audit_stream_recode.py` expected the old fixed-base call signature; it now
+  carries the shared-memory scratch argument.
+* `audit_deferred_chain.py` counted occurrences of one spelling of the
+  accumulation. The kernel has several chain variants whose y anchor is named
+  differently, so it now asserts the invariant instead: every accumulation
+  defers y exactly when the chunk is not the last, and re-anchors from the
+  affine y it just consumed, whether through `Load256` or the `QSB_S0_SHM`
+  shared-memory anchor.
+
+No assertion was relaxed to make a script pass. Each rewrite was checked with
+injected regressions: a hard-coded defer flag, a chain re-anchored from the
+wrong coordinate, a product tree stopping a level early, a tree width outside
+the modelled set, the super inversion reverted to a single block, a narrowed
+first recode window, and a plane count inconsistent with the layout. All seven
+are detected. The full suite runs in 19 seconds on a CPU-only workstation.

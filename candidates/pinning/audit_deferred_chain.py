@@ -233,9 +233,29 @@ def source_audit():
     assert "if (defer_y)" in mixed
     assert "Load256(Y1, Q);" in mixed
     assert "_ModMult(S2, (uint64_t *)Y2, ZZZ1);" in mixed
-    expected = "_PointAddXYZZ(X,Y,ZZ,ZZZ, cx,cy, y0, c != GT_CHUNKS-1);"
-    assert pinning.count(expected) == 2
-    assert pinning.count("Load256(y0, cy);") == 2
+    # The kernel carries several chain variants (QSB_UNROLL, QSB_EARLY_LOAD,
+    # QSB_S0_SHM), which differ in how they name the affine y anchor. Counting
+    # occurrences of one spelling therefore says nothing. Assert the invariant
+    # the model above verifies instead: EVERY accumulation defers y exactly
+    # when it is not the final chunk, and each one re-anchors from the affine y
+    # it just consumed.
+    call = re.compile(
+        r"_PointAddXYZZ\(X,Y,ZZ,ZZZ, cx,cy, (\w+), c != GT_CHUNKS-1\);")
+    sites = list(call.finditer(pinning))
+    assert sites, "no deferred-chain accumulation found"
+    # No accumulation may hard-code the defer flag or skip the chunk test.
+    for raw in re.finditer(r"_PointAddXYZZ\([^;]*;", pinning):
+        text = " ".join(raw.group(0).split())
+        if text.startswith("_PointAddXYZZ(X,Y,ZZ,ZZZ"):
+            assert "c != GT_CHUNKS-1" in text, text
+    for site in sites:
+        anchor = site.group(1)
+        tail = pinning[site.end():site.end() + 400]
+        # Register variants copy cy into the anchor; the QSB_S0_SHM variant
+        # writes it through to the shared-memory anchor slot instead.
+        reanchored = (f"Load256({anchor}, cy);" in tail
+                      or "QSB_Y0_ST(i,cy[i]);" in tail)
+        assert reanchored, anchor
 
 
 if __name__ == "__main__":
