@@ -1752,3 +1752,44 @@ deferred recurrence on 20,000 arbitrary-field accumulations, 1,000 curve
 accumulations, and 1,000 complete mixed-window accumulations. It also checks
 the production source form and the invariant after every intermediate point.
 All inherited field, root, vector-state, finish, and SHA-tail audits pass.
+
+## Local tooling: matched A/B harness and a portable tail audit (2026-09-17)
+
+No kernel change. Both items remove friction from the develop-on-CPU,
+measure-on-GPU loop this log already follows.
+
+`ab.sh` is the script the experiment-switch block at the top of `pinning.cu`
+refers to ("ab.sh overrides them with -D on the build line") but which was
+never committed. It takes a list of `NAME=VALUE` switch sets, builds each with
+`-D` on the documented `nvcc` line, and measures every one against a single
+pinned problem seed at one difficulty for one fixed window. It writes the build
+stamp `gpu_wrap.py` checks, so the compile stays outside the timed interval;
+that handshake was tested directly against `harness/gpu_wrap.py`, where a
+matching stamp is reused and a stamp naming a different `N` exits 3. Scores come
+from the harness clock and its verified hits, never from the kernel's advisory
+M/s line. The summary prints each variant's delta against the baseline and
+repeats the two thresholds that matter: +1.00 percent for promotion, and roughly
+1/sqrt(hits) of noise on a short run. `QSB_PROBE_MASK` runs are expected to fail
+verification and are reported as failures, which is the correct outcome for a
+switch documented as wrong math.
+
+`QSB_AB_DRYRUN=1` prints the build and run plan without invoking `nvcc`, so the
+grid can be checked on a workstation with no CUDA device.
+
+`check_tail_words.py` now carries its own SHA-256 block compression instead of
+calling libcrypto's `SHA256_Transform` through ctypes. That path is not
+portable: macOS aborts the process rather than dlopening its unversioned
+libcrypto stub, and the LibreSSL copies it does ship disagree with OpenSSL for
+this call. Every case is still compared against hashlib, so a wrong compression
+cannot pass silently, and the audit reports the same 2,320 comparisons as
+before. With this fixed, the whole ten-script audit suite runs on a CPU-only
+workstation in about 16 seconds.
+
+Startup cost was examined as an optimisation target and rejected. The host-side
+elliptic-curve work at kernel start -- `gt_build_ladders` plus the 252-point
+`gt_spot_check` -- measured 0.23 s through libcrypto, and the 64 MiB
+device-to-host copy feeding the check is single-digit milliseconds. Against a
+1200-second window that whole region is under 0.05 percent, far below both the
+1 percent promotion threshold and the roughly 0.7 percent statistical noise of
+the score. Removing the spot check would also give up the guard that catches a
+wrong table, whose failure mode is a full ranked run with zero verifiable hits.
