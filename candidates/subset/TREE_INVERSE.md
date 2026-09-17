@@ -306,3 +306,47 @@ shared, versus 128 registers and a 120-byte frame before). On a 150 s paired
 screen at 425 W the block throughput rises from 562.15 to 600.55 M candidates/s
 at 389.8 -> 403.8 W, i.e. +6.83 % throughput and +3.11 % candidates per joule,
 with every verified hit matching (10,802 of 10,802, zero failures).
+
+## CPU audits for the inverse tree (2026-09-17)
+
+The subset track had no CPU audit of its own, while the pinning track has ten.
+Two are added here, both runnable on a workstation with no CUDA device, in
+about three seconds together.
+
+`audit_tree_inverse.py` re-implements all three `ZLAB_TREE` schedules from the
+CUDA index arithmetic -- the heap layout of variants 0 and 1, the level-packed
+layout of the default variant 2 -- and checks that every lane ends holding the
+modular inverse of the value it supplied, with identity factors standing in for
+inactive lanes. It runs block widths 4 through 256 with all-active, all-inactive,
+mixed and single-active leaves, and asserts each schedule performs exactly one
+inversion and one canonicalization per block and costs 3*(n-1) multiplies. That
+re-derives the header's 765-multiply figure for a 256-lane block rather than
+trusting it. The source half asserts the normalization contract: variant 0 keeps
+every product canonical, while the lazy variants canonicalize exactly once, on
+the root, strictly before the inversion.
+
+`audit_zinv32.py` models the cooperative 4-lane inverse at C semantics --
+32-bit wraparound, int64 accumulators, arithmetic shifts of signed limbs -- with
+all four lanes and every `__shfl_sync`, and checks the result against
+`pow(x, p-2, p)` on 313 values including 0 -> 0 and sparse-limb inputs. The
+constants are re-derived, not copied: `-p^-1 mod 2^32`, the declared limbs of p,
+and the 977 of `p = 2^256 - 2^32 - 977`.
+
+Because that second audit is a hand transcription, it is only honest while the
+code it transcribed is the code being compiled. Substring assertions are not
+enough -- a statement can be inserted beside one and leave it intact -- so each
+transcribed function body is digested with comments and whitespace stripped.
+Any edit breaks the digest, and the correct response is to re-derive the CPU
+model against the new code and then update the digest, never to update the
+digest alone.
+
+Both were checked against injected regressions rather than assumed to work: an
+unmodelled default variant, a second canonicalization, inversion before
+canonicalization, a shared array too small for a 256-lane block, a statement
+added beside the divstep shifts, an inverted swap condition, a changed shift
+width, a flipped final select in the canonicalization, a wrong `-p^-1 mod 2^32`,
+a corrupted p limb, the result taken from the wrong lane, and the zero flag read
+from u instead of v. All are detected, while a comment reflow is not.
+
+These audits check algebra and code shape. They do not compile or run the
+kernel, and say nothing about its throughput.
