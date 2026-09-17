@@ -6,7 +6,16 @@ import re
 from pathlib import Path
 
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+# The per-candidate product tree is templated on QSB_TREE_N, so every width the
+# kernel accepts is modelled here rather than only the historical 256.
+TREE_WIDTHS = (256, 128, 64)
 LEAVES = 256
+
+
+def tree_width_default(source):
+    match = re.search(r"^#define\s+QSB_TREE_N\s+(\d+)", source, re.MULTILINE)
+    assert match, "QSB_TREE_N default not found"
+    return int(match.group(1))
 
 
 def audit_source():
@@ -18,21 +27,34 @@ def audit_source():
         match = re.search(rf"^#define\s+{name}\s+(\d+)$", source, re.MULTILINE)
         assert match and match.group(1) == value, (name, match)
 
+    # The compiled-in width must be one this audit actually models, and the
+    # checkpoint stride must cover the widest tree it can be asked to store.
+    default_n = tree_width_default(source)
+    assert default_n in TREE_WIDTHS, default_n
+    assert max(TREE_WIDTHS) <= int(
+        re.search(r"^#define\s+QSB_CHECKPOINT_STRIDE\s+(\d+)", source, re.MULTILINE).group(1)
+    )
+    assert re.search(r"#if QSB_TREE_N != 256 && QSB_TREE_N != 128 && QSB_TREE_N != 64",
+                     source), "the kernel's accepted widths changed"
+
     up_begin = source.index("void qsb_block_product_checkpoint(")
     up_end = source.index("void qsb_block_inverse_checkpoint(", up_begin)
     up = source[up_begin:up_end]
-    assert "for(int count=256;count>1;count>>=1)" in up
-    assert "if(node<510)" in up
-    assert "node-256" in up
-    assert "products[k][510]" in up
+    assert "for(int count=N;count>1;count>>=1)" in up
+    assert "if(node<2*N-2)" in up
+    assert "node-N" in up
+    assert "products[k][2*N-2]" in up
 
     down_begin = up_end
     down_end = source.index("__global__ void __launch_bounds__(256,2) qsb_root_group_prepare", down_begin)
     down = source[down_begin:down_end]
-    assert "if(tid<QSB_CHECKPOINT_NODES)" in down
-    assert "products[k][256+tid]" in down
-    assert "for(int count=2;count<256;count<<=1)" in down
-    assert "inverses[k][254]" in down
+    assert "if(tid<N-2)" in down
+    assert "products[k][N+tid]" in down
+    assert "for(int count=2;count<N;count<<=1)" in down
+    assert "inverses[k][N-2]" in down
+    # the single leaf multiply that closes the downward pass
+    assert "inverses[k][tid&(N/2-1)]" in down
+    assert "products[k][tid^(N/2)]" in down
     assert "qsb_field_normalize(value);" in down
 
     root_begin = source.index("__device__ __forceinline__ void qsb_block_inverse(")
@@ -50,42 +72,46 @@ def audit_source():
     assert "GRDSZ*4u*QSB_CHECKPOINT_STRIDE*sizeof(uint64_t)" in source
 
 
-def checkpoint_up(raw, active):
-    products = [0] * 511
-    products[:LEAVES] = [x % P if use and x % P else 1 for x, use in zip(raw, active)]
+def checkpoint_up(raw, active, n=LEAVES):
+    products = [0] * (2 * n - 1)
+    products[:n] = [x % P if use and x % P else 1 for x, use in zip(raw, active)]
     offset = 0
-    for count in (256, 128, 64, 32, 16, 8, 4, 2):
+    count = n
+    while count > 1:
         half = count // 2
         for tid in range(half):
             products[offset + count + tid] = (
                 products[offset + tid] * products[offset + half + tid] % P
             )
         offset += count
-    assert offset == 510
-    # CUDA stores exactly nodes 256..509; node 510 uses the compact root array.
-    return products[256:510], products[510], products[:256]
+        count >>= 1
+    assert offset == 2 * n - 2
+    # CUDA stores exactly nodes n..2n-3; node 2n-2 uses the compact root array.
+    return products[n:2 * n - 2], products[2 * n - 2], products[:n]
 
 
-def checkpoint_down(saved_internal, root, leaves):
-    assert len(saved_internal) == 254
+def checkpoint_down(saved_internal, root, leaves, n=LEAVES):
+    assert len(saved_internal) == n - 2
     products = list(leaves) + list(saved_internal) + [None]
-    inverses = [0] * 255
+    inverses = [0] * (n - 1)
     # The root kernel is the only internal normalization boundary.
-    inverses[254] = pow(root % P, P - 2, P)
-    offset = 508
-    for count in (2, 4, 8, 16, 32, 64, 128):
+    inverses[n - 2] = pow(root % P, P - 2, P)
+    offset = 2 * n - 4
+    count = 2
+    while count < n:
         half = count // 2
         for tid in range(count):
-            parent = offset + count - 256 + (tid & (half - 1))
-            inverses[offset - 256 + tid] = (
+            parent = offset + count - n + (tid & (half - 1))
+            inverses[offset - n + tid] = (
                 inverses[parent] * products[offset + (tid ^ half)] % P
             )
         offset -= 2 * count
+        count <<= 1
     assert offset == 0
     # The CUDA leaf multiply is followed by the only per-leaf normalization.
     return [
-        inverses[tid & 127] * products[tid ^ 128] % P
-        for tid in range(LEAVES)
+        inverses[tid & (n // 2 - 1)] * products[tid ^ (n // 2)] % P
+        for tid in range(n)
     ]
 
 
@@ -127,27 +153,29 @@ def main():
     audit_source()
     rng = random.Random(0x455854524F4F54)
     cases = 0
-    for active_count in (0, 1, 31, 32, 33, 127, 128, 129, 255, 256):
-        raw = [rng.randrange(P) for _ in range(LEAVES)]
-        for i in range(0, LEAVES, 37):
-            raw[i] = 0
-        active = [i < active_count for i in range(LEAVES)]
-        internal, root, leaves = checkpoint_up(raw, active)
-        got = checkpoint_down(internal, root, leaves)
-        want = [pow(x, P - 2, P) for x in leaves]
-        assert got == want
-        cases += 1
-    for _ in range(200):
-        raw = [rng.randrange(P) for _ in range(LEAVES)]
-        active = [rng.randrange(8) != 0 for _ in range(LEAVES)]
-        for i in range(LEAVES):
-            if rng.randrange(64) == 0:
+    for n in TREE_WIDTHS:
+        boundaries = [0, 1, n // 2 - 1, n // 2, n // 2 + 1, n - 1, n]
+        for active_count in sorted(set(boundaries)):
+            raw = [rng.randrange(P) for _ in range(n)]
+            for i in range(0, n, 37):
                 raw[i] = 0
-        internal, root, leaves = checkpoint_up(raw, active)
-        assert checkpoint_down(internal, root, leaves) == [
-            pow(x, P - 2, P) for x in leaves
-        ]
-        cases += 1
+            active = [i < active_count for i in range(n)]
+            internal, root, leaves = checkpoint_up(raw, active, n)
+            got = checkpoint_down(internal, root, leaves, n)
+            want = [pow(x, P - 2, P) for x in leaves]
+            assert got == want, (n, active_count)
+            cases += 1
+        for _ in range(200):
+            raw = [rng.randrange(P) for _ in range(n)]
+            active = [rng.randrange(8) != 0 for _ in range(n)]
+            for i in range(n):
+                if rng.randrange(64) == 0:
+                    raw[i] = 0
+            internal, root, leaves = checkpoint_up(raw, active, n)
+            assert checkpoint_down(internal, root, leaves, n) == [
+                pow(x, P - 2, P) for x in leaves
+            ], n
+            cases += 1
 
     finish_cases = 0
     while finish_cases < 10000:
@@ -159,7 +187,8 @@ def main():
         )
         finish_cases += 1
 
-    print(f"PASS: {cases} split trees and {finish_cases} C/W finish comparisons")
+    print(f"PASS: {cases} split trees across widths {TREE_WIDTHS} and "
+          f"{finish_cases} C/W finish comparisons")
 
 
 if __name__ == "__main__":

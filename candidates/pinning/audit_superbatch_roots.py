@@ -45,8 +45,16 @@ def tree_down(leaves, internal, root_inverse):
 
 
 def nested_inverse(values):
+    """Model the two-level inversion, including the multi-block super level.
+
+    qsb_invert_super_roots launches ceil(groups/WIDTH) blocks, each of which
+    runs its own block product tree, one _ModInv and its own downward pass. A
+    16M batch at QSB_TREE_N=128 produces 131,072 search CTAs and therefore 512
+    groups, so more than one super block is the normal case, not an edge one.
+    Returns (inverses, groups, modinvs).
+    """
     count = len(values)
-    assert 0 < count <= WIDTH * WIDTH
+    assert count > 0
     groups = (count + WIDTH - 1) // WIDTH
     saved = []
     group_roots = []
@@ -58,15 +66,22 @@ def nested_inverse(values):
         saved.append((leaves, internal))
         group_roots.append(root)
 
-    super_leaves = group_roots + [1] * (WIDTH - groups)
-    super_leaves, super_internal, super_root = tree_up(super_leaves)
-    super_inverse = pow(super_root, P - 2, P)
-    group_inverses = tree_down(super_leaves, super_internal, super_inverse)
+    # One independent block inversion per 256 group roots; inactive lanes in
+    # the final block carry the identity, exactly as the kernel does.
+    group_inverses = []
+    modinvs = 0
+    for start in range(0, groups, WIDTH):
+        chunk = group_roots[start:start + WIDTH]
+        super_leaves = chunk + [1] * (WIDTH - len(chunk))
+        super_leaves, super_internal, super_root = tree_up(super_leaves)
+        super_inverse = pow(super_root, P - 2, P)
+        modinvs += 1
+        group_inverses.extend(tree_down(super_leaves, super_internal, super_inverse)[:len(chunk)])
 
     result = []
     for group, (leaves, internal) in enumerate(saved):
         result.extend(tree_down(leaves, internal, group_inverses[group]))
-    return result[:count], groups
+    return result[:count], groups, modinvs
 
 
 def audit_source():
@@ -75,16 +90,16 @@ def audit_source():
     super_inverse = source.index("qsb_invert_super_roots(", prepare)
     finish = source.index("qsb_root_group_finish(", super_inverse)
     recovery = source.index("/* Shared-denominator recovery", finish)
-    assert "qsb_block_product_checkpoint(r,super_roots,root_checkpoint);" in source[prepare:super_inverse]
+    assert "qsb_block_product_checkpoint<256>(r,super_roots,root_checkpoint);" in source[prepare:super_inverse]
     assert "qsb_block_inverse(r);" in source[super_inverse:finish]
-    assert "qsb_block_inverse_checkpoint(r,super_roots,root_checkpoint);" in source[finish:recovery]
+    assert "qsb_block_inverse_checkpoint<256>(r,super_roots,root_checkpoint);" in source[finish:recovery]
     launch_begin = source.index("static void launch_pinning_pipeline(")
     launch_end = source.index(" * Fixed-base table construction", launch_begin)
     launches = source[launch_begin:launch_end]
     names = (
         "kernel_pinning_pipeline<FAST_TAIL,0>",
         "qsb_root_group_prepare<<<root_groups,256>>>",
-        "qsb_invert_super_roots<<<1,256>>>",
+        "qsb_invert_super_roots<<<(root_groups+255)/256,256>>>",
         "qsb_root_group_finish<<<root_groups,256>>>",
         "kernel_pinning_pipeline<FAST_TAIL,2>",
     )
@@ -97,19 +112,27 @@ def audit_source():
 def main():
     audit_source()
     rng = random.Random(0x5355504552524F4F)
-    counts = (1, 2, 17, 255, 256, 257, 511, 512, 513, 4097, 65535, 65536)
+    # 65536 is one full super block; 65537 and 131072 exercise the multi-block
+    # super level a default 16M batch at QSB_TREE_N=128 actually reaches.
+    counts = (1, 2, 17, 255, 256, 257, 511, 512, 513, 4097, 65535, 65536,
+              65537, 131072)
     checked = 0
+    total_modinvs = 0
     for count in counts:
         values = []
         while len(values) < count:
             value = rng.getrandbits(256)
             if value % P:
                 values.append(value)
-        got, groups = nested_inverse(values)
+        got, groups, modinvs = nested_inverse(values)
         assert groups == (count + WIDTH - 1) // WIDTH
+        assert modinvs == (groups + WIDTH - 1) // WIDTH, (count, groups, modinvs)
         assert all((value % P) * inverse % P == 1 for value, inverse in zip(values, got))
         checked += count
-    print(f"PASS: two-level root inversion; {checked} roots across {len(counts)} boundary sizes")
+        total_modinvs += modinvs
+    print(f"PASS: two-level root inversion; {checked} roots across {len(counts)} "
+          f"boundary sizes, including multi-block super inversion "
+          f"({total_modinvs} _ModInv calls total)")
 
 
 if __name__ == "__main__":

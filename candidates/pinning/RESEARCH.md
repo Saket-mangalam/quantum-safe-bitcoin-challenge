@@ -1793,3 +1793,41 @@ device-to-host copy feeding the check is single-digit milliseconds. Against a
 1 percent promotion threshold and the roughly 0.7 percent statistical noise of
 the score. Removing the spot check would also give up the guard that catches a
 wrong table, whose failure mode is a full ranked run with zero verifiable hits.
+
+## Audit suite realigned with the promoted kernel (2026-09-17)
+
+Five of the ten audits failed against the current candidate. Every failure was
+in `audit_source()`, never in a mathematical check, so the algebra was still
+sound — but the source half of the safety net had stopped inspecting the kernel
+that actually ships. Two of the five were also modelling shapes the default
+build no longer uses, which is the more serious half: they passed their maths
+against the wrong kernel.
+
+* `audit_vector_state_layout.py` asserted 8 state planes and 128 bytes per
+  candidate. `QSB_SYM_FINISH` defaults to 1, so a ranked build stores Y, ZZZ and
+  W in 6 planes, 96 bytes, 1.5 GiB at 16,777,216 candidates. It now models both
+  layouts and checks each against its own branch of the source, including that W
+  stays in planes 4-5 so the tree kernels index it identically.
+* `audit_external_pipeline.py` modelled a 256-leaf product tree. The tree is
+  templated on `QSB_TREE_N`, whose default is now 128, so it now models 256, 128
+  and 64, asserts the compiled-in width is one it models, and matches the
+  templated source forms rather than literal 256s.
+* `audit_superbatch_roots.py` capped its model at one super block. With a 16M
+  batch at `QSB_TREE_N=128` there are 131,072 search CTAs and therefore 512
+  groups, so `qsb_invert_super_roots` runs several blocks and performs one
+  `_ModInv` each. The model now covers that and asserts the inversion count.
+* `audit_stream_recode.py` expected the old fixed-base call signature; it now
+  carries the shared-memory scratch argument.
+* `audit_deferred_chain.py` counted occurrences of one spelling of the
+  accumulation. The kernel has several chain variants whose y anchor is named
+  differently, so it now asserts the invariant instead: every accumulation
+  defers y exactly when the chunk is not the last, and re-anchors from the
+  affine y it just consumed, whether through `Load256` or the `QSB_S0_SHM`
+  shared-memory anchor.
+
+No assertion was relaxed to make a script pass. Each rewrite was checked with
+injected regressions: a hard-coded defer flag, a chain re-anchored from the
+wrong coordinate, a product tree stopping a level early, a tree width outside
+the modelled set, the super inversion reverted to a single block, a narrowed
+first recode window, and a plane count inconsistent with the layout. All seven
+are detected. The full suite runs in 19 seconds on a CPU-only workstation.
