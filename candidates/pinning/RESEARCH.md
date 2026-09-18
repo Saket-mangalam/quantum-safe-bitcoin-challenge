@@ -1831,3 +1831,54 @@ wrong coordinate, a product tree stopping a level early, a tree width outside
 the modelled set, the super inversion reverted to a single block, a narrowed
 first recode window, and a plane count inconsistent with the layout. All seven
 are detected. The full suite runs in 19 seconds on a CPU-only workstation.
+
+## Batch-affine summation of the fixed-base points: analysis (2026-09-17)
+
+The 15 signed-digit table points are summed by a deferred-Y XYZZ chain costing
+95M+28S. Projective coordinates exist to avoid inversions, but an affine
+addition is only 2M+1S once 1/(x2-x1) is known, and the seven pair additions of
+the first summation level are independent, so their inverses batch by
+Montgomery's trick -- 3(k-1) multiplies for k values -- on top of the
+block-wide inverse this kernel already performs. Batch-affine addition beating
+projective for independent additions is the result multi-scalar-multiplication
+implementations rely on; it applies here because a block of lanes supplies
+hundreds of independent additions at the same tree level.
+
+`research_batch_affine.py` verifies every structure below against the reference
+15-point sum and counts its cost. Squarings are counted at 0.8 of a multiply,
+and each block-wide inverse is charged the 3 multiplies per lane its product
+tree costs.
+
+| structure | cost | inversion rounds | peak live | table bytes | delta |
+|---|---|---|---|---|---|
+| XYZZ chain (today) | 98M+28S = 120.4 | 1 | 7 | 960 | - |
+| 1 affine level, batch 2 | 84M+21S = 100.8 | 5 | 8 | 1408 | -16.3% |
+| 1 affine level, batch 4 | 84M+21S = 100.8 | 3 | 10 | 1408 | -16.3% |
+| 1 affine level, batch 7 | 84M+21S = 100.8 | 2 | 13 | 1408 | -16.3% |
+| full affine tree | 73M+14S = 84.2 | 5 | 37 | 960 | -30.1% |
+
+The full tree is cheapest in multiplies and the least implementable: its
+intermediate points must all survive each level, 37 field elements per lane,
+148 KiB of shared memory at 128 lanes. The hybrid keeps one affine level and
+feeds its pair sums into the existing chain; only that batch's denominators
+cross a barrier, so batch 2 holds two of them. The first pass reads x halves
+only, since a denominator does not depend on a digit's sign, and the second
+re-reads full records once the inverses exist -- 1408 table bytes per candidate
+against 960 today.
+
+An earlier version of this analysis counted only the denominators as live state
+and reported the full tree as a -34.7% candidate. That was wrong: it ignored the
+intermediate points each level must keep. The corrected accounting is what rules
+the full tree out and leaves the hybrid as the implementable one.
+
+What none of this establishes is throughput. Every extra inversion round is a
+block-wide barrier the chain does not pay, and whether occupancy hides it is a
+property of the GPU, not of the algebra. Measure with `ab.sh` before believing
+any of these numbers predict a score.
+
+Two directions were checked and rejected. GLV endomorphism, which the root
+README lists as open, does not help a fixed-base multiply: halving the scalar
+length doubles the number of digits, leaving the addition count unchanged; it
+pays off for variable-base work, where doublings dominate. Widening the windows
+from 15 chunks to 14 needs roughly 134 MiB of table against a 72 MB L2, for 6.7%
+fewer additions.
