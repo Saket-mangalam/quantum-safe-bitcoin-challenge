@@ -103,6 +103,18 @@ static_assert(alignof(ulonglong2) == 16, "pipeline vector must be 16-byte aligne
 #ifndef QSB_PROBE_MASK
 #define QSB_PROBE_MASK 0      /* speed probe only: mask table indices to shrink the working set (wrong math) */
 #endif
+#ifndef QSB_BATCH_AFFINE
+#define QSB_BATCH_AFFINE 0    /* PROTOTYPE, NEVER BUILT OR MEASURED: sum the first
+                               * tree level of the fixed-base points in affine
+                               * coordinates, two pairs per block-wide inverse.
+                               * 84M+21S against the chain's 98M+28S (-16.3%) at
+                               * the cost of four extra inversion rounds; see
+                               * research_batch_affine.py. Default 0: a ranked
+                               * build is byte-identical to the chain. */
+#endif
+#if QSB_BATCH_AFFINE && QSB_PROBE_MASK
+#error "QSB_BATCH_AFFINE and QSB_PROBE_MASK cannot be combined"
+#endif
 #if QSB_TREE_N != 256 && QSB_S0_THREADS == 256
 #undef QSB_S0_THREADS
 #define QSB_S0_THREADS QSB_TREE_N
@@ -1405,6 +1417,252 @@ __device__ __forceinline__ uint32_t qsb_xyzz_finish_symmetric(
     return parities;
 }
 
+#if QSB_BATCH_AFFINE
+/* ===================== batch-affine prototype (untested) =====================
+ * An affine addition costs 2M+1S once 1/(x2-x1) is known, against 7M+2S for a
+ * deferred-Y XYZZ step, and the seven pair additions of the first summation
+ * level are independent, so their inverses batch by Montgomery's trick on top
+ * of the block-wide inverse this kernel already runs. research_batch_affine.py
+ * verifies the algebra against the reference sum and counts the cost:
+ * 84M+21S here against 98M+28S for the chain, at four extra inversion rounds.
+ *
+ * Whether that trade wins on an RTX 4090 is unknown: every extra round is a
+ * block-wide barrier, and this has never been compiled. Build it with
+ *   nvcc -O3 -DQSB_ZEROS_N=24 -DQSB_BATCH_AFFINE=1 ...
+ * and measure it against the default with ab.sh. Correctness is decided by the
+ * harness verifier, not by this comment: a wrong point yields no verified hits.
+ * ========================================================================== */
+
+/* The denominator x2-x1 does not depend on a digit's sign, so the first pass
+ * reads the 32-byte x half of each record instead of the whole 64 bytes. */
+__device__ __forceinline__ void gt_load_x_flat(const uint8_t *gTable,
+                                               uint32_t base, uint32_t idx,
+                                               uint64_t gx[4]) {
+    size_t off = ((size_t)base + idx) * 64;
+    const ulonglong2 *tx=(const ulonglong2 *)(gTable+off);
+    ulonglong2 x0=tx[0],x1=tx[1];
+    gx[0]=x0.x;gx[1]=x0.y;gx[2]=x1.x;gx[3]=x1.y;
+}
+
+/* One shared allocation for every call site, as qsb_prepare_scratch does:
+ * 4x(2N) products followed by 4xN inverses, N = the prepare block width. */
+__device__ __forceinline__ uint64_t *qsb_ba_scratch() {
+    __shared__ uint64_t buf[12*QSB_S0_THREADS];
+    return buf;
+}
+#define QSB_BA_PROD(s,k,i) (s)[(size_t)(k)*(2*N)+(size_t)(i)]
+#define QSB_BA_INV(s,k,i)  (s)[(size_t)8*N+(size_t)(k)*N+(size_t)(i)]
+
+/* Self-contained block-wide inverse over N lanes: the level-packed schedule of
+ * qsb_block_product_checkpoint/qsb_block_inverse_checkpoint without the global
+ * checkpoint, so it can run several times inside one kernel. Whole-block
+ * participation is required; the caller maps lanes with nothing to invert to
+ * the multiplicative identity. Leaves come back as exact residues.
+ * The schedule is the one modelled in candidates/subset/audit_tree_inverse.py. */
+template<int N>
+__device__ __forceinline__ void qsb_block_inverse_inline(uint64_t *value) {
+    uint64_t *s = qsb_ba_scratch();
+    const int tid=threadIdx.x;
+
+    /* an earlier call may still be reading these cells */
+    __syncthreads();
+    #pragma unroll
+    for(int k=0;k<4;k++)QSB_BA_PROD(s,k,tid)=value[k];
+    __syncthreads();
+
+    int offset=0;
+    #pragma unroll 1
+    for(int count=N;count>2;count>>=1){
+        int half=count>>1;
+        if(tid<half){
+            uint64_t a[5],b[5],out[5];
+            #pragma unroll
+            for(int k=0;k<4;k++){
+                a[k]=QSB_BA_PROD(s,k,offset+tid);
+                b[k]=QSB_BA_PROD(s,k,offset+half+tid);
+            }
+            a[4]=b[4]=0;
+            qsb_field_mul(out,a,b);
+            #pragma unroll
+            for(int k=0;k<4;k++)QSB_BA_PROD(s,k,offset+count+tid)=out[k];
+        }
+        offset+=count;
+        __syncthreads();
+    }
+    /* offset == 2N-4: the two root children. Lane 0 forms the root, inverts it
+     * and writes both child inverses, exactly as the checkpointed form does. */
+    if(tid==0){
+        uint64_t a[5],b[5],root[5],c0[5],c1[5];
+        #pragma unroll
+        for(int k=0;k<4;k++){
+            a[k]=QSB_BA_PROD(s,k,offset);
+            b[k]=QSB_BA_PROD(s,k,offset+1);
+        }
+        a[4]=b[4]=0;
+        qsb_field_mul(root,a,b);
+        qsb_field_normalize(root);
+        _ModInv(root);
+        root[4]=0;
+        qsb_field_mul(c0,root,b);              /* 1/a */
+        qsb_field_mul(c1,root,a);              /* 1/b */
+        #pragma unroll
+        for(int k=0;k<4;k++){
+            QSB_BA_INV(s,k,offset-N)=c0[k];
+            QSB_BA_INV(s,k,offset-N+1)=c1[k];
+        }
+    }
+    __syncthreads();
+
+    offset-=4;
+    #pragma unroll 1
+    for(int count=4;count<N;count<<=1){
+        int half=count>>1;
+        if(tid<count){
+            uint64_t parent_inv[5],sibling[5],child_inv[5];
+            #pragma unroll
+            for(int k=0;k<4;k++){
+                parent_inv[k]=QSB_BA_INV(s,k,offset+count-N+(tid&(half-1)));
+                sibling[k]=QSB_BA_PROD(s,k,offset+(tid^half));
+            }
+            parent_inv[4]=sibling[4]=0;
+            qsb_field_mul(child_inv,parent_inv,sibling);
+            #pragma unroll
+            for(int k=0;k<4;k++)QSB_BA_INV(s,k,offset-N+tid)=child_inv[k];
+        }
+        offset-=count<<1;
+        __syncthreads();
+    }
+    {
+        const int half=N>>1;
+        uint64_t parent_inv[5],sibling[5];
+        #pragma unroll
+        for(int k=0;k<4;k++){
+            parent_inv[k]=QSB_BA_INV(s,k,tid&(half-1));
+            sibling[k]=QSB_BA_PROD(s,k,tid^half);
+        }
+        parent_inv[4]=sibling[4]=0;
+        qsb_field_mul(value,parent_inv,sibling);
+    }
+    qsb_field_normalize(value);
+    value[4]=0;
+}
+
+/* Pairs (0,1),(2,3),...,(12,13) are summed in affine coordinates, two pairs per
+ * block-wide inverse, and the seven pair sums plus the carried chunk 14 feed the
+ * existing deferred-Y chain. Only two denominators cross each barrier.
+ *
+ * Anchor convention, from GPUMath.h: _PointAddXYZZ_mm defers against its FIRST
+ * point's y, and each deferred _PointAddXYZZ re-anchors on the point it just
+ * added. Getting this backwards yields wrong points that still hash, so the
+ * verifier -- not this kernel -- is what proves it right. */
+template<int N>
+__device__ void _FixedBaseBatchAffine2Scalar(uint64_t *X, uint64_t *Y,
+                                             uint64_t *ZZ, uint64_t *ZZZ,
+                                             const uint64_t k[4],
+                                             const uint8_t *gTable) {
+    uint64_t M[4]; int sign;
+    gt_recode_setup(k, M, &sign);
+
+    uint64_t s0x[4],s0y[4];        /* first pair sum, held until the second */
+    uint64_t anchor[4];            /* affine y the accumulator is deferred against */
+    int emitted=0;
+    bool degenerate=false;
+
+    /* Fully unrolled so every index into these arrays is a compile-time
+     * constant: a runtime index would push them into local memory, which is
+     * the trap RESEARCH.md records for the digit array. */
+    #pragma unroll
+    for(int b=0;b<4;b++){
+        const int pairs=(b<3)?2:1;
+        uint32_t idx[4]; uint64_t neg[4]; uint32_t base[4];
+        uint64_t den[2][4];
+
+        /* pass A: digits, then x halves only, to form this batch's denominators */
+        #pragma unroll
+        for(int j=0;j<pairs*2;j++){
+            const int c=b*4+j;
+            int32_t ec = (c==0) ? gt_mixed_step<18>(M,sign)
+                                : gt_mixed_step<17>(M,sign);
+            gt_digit_idx(ec,&idx[j],&neg[j]);
+            base[j]=gt_offset(c);
+        }
+        #pragma unroll
+        for(int q=0;q<pairs;q++){
+            uint64_t xa[4],xb[4];
+            gt_load_x_flat(gTable,base[2*q],idx[2*q],xa);
+            gt_load_x_flat(gTable,base[2*q+1],idx[2*q+1],xb);
+            _ModSub256(den[q],xb,xa);
+            if((den[q][0]|den[q][1]|den[q][2]|den[q][3])==0ULL){
+                /* Distinct table entries cannot collide, but a zero here would
+                 * zero the whole block's product. Substitute the identity and
+                 * discard this candidate below rather than corrupt the block. */
+                degenerate=true;
+                den[q][0]=1ULL; den[q][1]=den[q][2]=den[q][3]=0ULL;
+            }
+        }
+
+        uint64_t prod[5];
+        if(pairs==2){ _ModMult(prod,den[0],den[1]); }
+        else        { Load256(prod,den[0]); }
+        prod[4]=0;
+        qsb_block_inverse_inline<N>(prod);      /* collective: every lane enters */
+        uint64_t inv[2][4];
+        if(pairs==2){
+            _ModMult(inv[0],prod,den[1]);       /* 1/den0 */
+            _ModMult(inv[1],prod,den[0]);       /* 1/den1 */
+        } else {
+            Load256(inv[0],prod);
+        }
+
+        /* pass B: full records now that the inverses exist */
+        #pragma unroll
+        for(int q=0;q<pairs;q++){
+            uint64_t ax[4],ay[4],bx[4],by[4];
+            gt_load_signed_flat(gTable,base[2*q],idx[2*q],neg[2*q],ax,ay);
+            gt_load_signed_flat(gTable,base[2*q+1],idx[2*q+1],neg[2*q+1],bx,by);
+            uint64_t lam[4],t[4],sx[4],sy[4];
+            _ModSub256(t,by,ay);
+            _ModMult(lam,t,inv[q]);             /* lambda = (yb-ya)/(xb-xa) */
+            _ModSqr(sx,lam);
+            _ModSub256(sx,ax);
+            _ModSub256(sx,bx);                  /* x3 = lambda^2 - xa - xb */
+            _ModSub256(t,ax,sx);
+            _ModMult(t,lam);
+            _ModSub256(sy,t,ay);                /* y3 = lambda*(xa-x3) - ya */
+            if(emitted==0){
+                Load256(s0x,sx); Load256(s0y,sy);
+            } else if(emitted==1){
+                _PointAddXYZZ_mm(X,Y,ZZ,ZZZ,s0x,s0y,sx,sy);
+                Load256(anchor,s0y);            /* mmadd defers against y of the FIRST point */
+            } else {
+                _PointAddXYZZ(X,Y,ZZ,ZZZ,sx,sy,anchor,true);
+                Load256(anchor,sy);
+            }
+            emitted++;
+        }
+    }
+
+    /* chunk 14 is carried unpaired and closes the chain with the resolving add */
+    {
+        int32_t ec=sign*(int32_t)M[0];
+        uint32_t cidx; uint64_t cneg;
+        gt_digit_idx(ec,&cidx,&cneg);
+        uint64_t cx[4],cy[4];
+        gt_load_signed_flat(gTable,gt_offset(GT_CHUNKS-1),cidx,cneg,cx,cy);
+        _PointAddXYZZ(X,Y,ZZ,ZZZ,cx,cy,anchor,false);
+    }
+
+    if(degenerate){
+        /* ZZ == 0 makes the finish's shared denominator zero, which is exactly
+         * how it already recognises an unusable candidate. */
+        #pragma unroll
+        for(int i=0;i<4;i++){ ZZ[i]=0ULL; ZZZ[i]=0ULL; }
+    }
+}
+#undef QSB_BA_PROD
+#undef QSB_BA_INV
+#endif  /* QSB_BATCH_AFFINE */
+
 template<bool FAST_TAIL, int STAGE>
 __global__ void __launch_bounds__(STAGE == 0 ? QSB_S0_THREADS : QSB_S2_THREADS,
                                   STAGE == 0 ? QSB_S0_BLOCKS : QSB_S2_BLOCKS) kernel_pinning_pipeline(
@@ -1516,7 +1774,11 @@ __global__ void __launch_bounds__(STAGE == 0 ? QSB_S0_THREADS : QSB_S2_THREADS,
      * directly yields z*A = (neg_r_inv*z mod n)*G without a per-candidate
      * scalar multiplication. */
     /* u1*G as raw XYZZ via the signed 64 MiB A-table. */
+#if QSB_BATCH_AFFINE
+    _FixedBaseBatchAffine2Scalar<QSB_S0_THREADS>(qx,qy,qzz,qzzz,z,d_gt);
+#else
     _FixedBaseSignedXYZZScalar(qx,qy,qzz,qzzz,z,d_gt,qsb_prepare_scratch());
+#endif
 
     /* Recover P+R and P-R together with one shared denominator inverse. The
      * prepare-only xR copy dies before the collective; reload R afterward so

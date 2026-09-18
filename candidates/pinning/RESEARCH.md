@@ -1882,3 +1882,53 @@ length doubles the number of digits, leaving the addition count unchanged; it
 pays off for variable-base work, where doublings dominate. Widening the windows
 from 15 chunks to 14 needs roughly 134 MiB of table against a 72 MB L2, for 6.7%
 fewer additions.
+
+## Batch-affine prototype behind QSB_BATCH_AFFINE (2026-09-17)
+
+`QSB_BATCH_AFFINE`, default 0, selects `_FixedBaseBatchAffine2Scalar` in place
+of `_FixedBaseSignedXYZZScalar`. Pairs (0,1) through (12,13) are summed in
+affine coordinates, two pairs per block-wide inverse, and the seven pair sums
+plus the carried chunk 14 feed the existing deferred-Y chain. With the switch
+off the compiled kernel is the chain, unchanged.
+
+It brings its own collective: `qsb_block_inverse_inline<N>`, the level-packed
+schedule of the checkpointed pair without the global checkpoint, so it can run
+several times inside one kernel. Its shared memory comes from a single
+allocation accessor, the pattern `qsb_prepare_scratch` already uses, because a
+`__shared__` array declared inside a function inlined at four call sites is not
+guaranteed to be one allocation. The schedule is the one modelled and verified
+in `../subset/audit_tree_inverse.py`.
+
+**This has never been compiled or run.** There is no CUDA device on the machine
+it was written on. What was checked:
+
+* the algebra, including the exact prototype sequence -- pair sums, the mmadd
+  seed, deferred steps, the resolving addition -- reproduces the reference
+  15-point sum (`research_batch_affine.py`);
+* the anchor convention it depends on, read from GPUMath.h: the mmadd defers
+  against its FIRST point's y, each deferred `_PointAddXYZZ` re-anchors on the
+  point just added, and only the final addition resolves. Getting this backwards
+  produces wrong points that still hash, so it is the riskiest line in the file;
+* the prototype compiles as C++ at both plausible block widths, with every
+  helper declared at its real signature, under `clang++ -fsyntax-only -Wall`
+  (no diagnostics). That proves well-formedness, not arithmetic.
+
+Everything else is unverified: register pressure, spills, shared-memory
+pressure against occupancy, whether four extra barriers are hidden, and the
++448 bytes per candidate of table traffic from the x-only first pass.
+
+To measure it:
+
+```
+QSB_AB_GRID="" ./candidates/pinning/ab.sh "" "QSB_BATCH_AFFINE=1"
+```
+
+Correctness is decided by the harness verifier, not by inspection: a wrong
+point yields no verifiable hits, and a run with unverifiable hits is rejected
+outright. Run it at a low N first, where hits are plentiful, before trusting a
+ranked window.
+
+`audit_deferred_chain.py` now strips `#if QSB_BATCH_AFFINE` regions before
+asserting on the chain, and asserts the switch still defaults to 0. If the
+prototype is ever made the default, that assertion fails and the audit has to
+be taught the new path rather than silently skipping it.

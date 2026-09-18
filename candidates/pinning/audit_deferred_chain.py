@@ -222,10 +222,42 @@ def function_body(text, marker):
     raise AssertionError(f"unterminated function {marker}")
 
 
+def strip_disabled(source, macro):
+    """Drop `#if <macro>` regions, nesting-aware, when <macro> defaults to 0.
+
+    A prototype behind a default-off switch is not in the compiled kernel, so
+    the assertions below must not read it. The default is verified here rather
+    than assumed: if the switch is ever turned on by default, this raises and
+    the audit has to be taught the new code path instead of ignoring it.
+    """
+    default = re.search(rf"^#define {macro} (\d+)", source, re.MULTILINE)
+    assert default, f"{macro} default not found"
+    assert default.group(1) == "0", (
+        f"{macro} now defaults to {default.group(1)}: it is part of the compiled "
+        f"kernel and this audit must cover it, not skip it")
+    out, depth, skipping = [], 0, False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#if"):
+            if not skipping and stripped == f"#if {macro}":
+                skipping, depth = True, 0
+                continue
+            if skipping:
+                depth += 1
+        elif skipping and stripped.startswith("#endif"):
+            if depth == 0:
+                skipping = False
+                continue
+            depth -= 1
+        if not skipping:
+            out.append(line)
+    return "\n".join(out)
+
+
 def source_audit():
     root = Path(__file__).resolve().parent
     math = (root / "GPUMath.h").read_text()
-    pinning = (root / "pinning.cu").read_text()
+    pinning = strip_disabled((root / "pinning.cu").read_text(), "QSB_BATCH_AFFINE")
     mixed = function_body(math, "__device__ void _PointAddXYZZ(uint64_t")
     assert len(re.findall(r"\b_ModMult\(", mixed)) == 8
     assert len(re.findall(r"\b_ModSqr\(", mixed)) == 2
